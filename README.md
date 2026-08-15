@@ -315,50 +315,19 @@ cannot be reviewed:
 
 ## Why this pattern (governance)
 
-> **TODO — rewrite in the author's own voice.** Draft below; the argument is
-> right, the phrasing is mine, not his.
+I work mostly on systems in regulated environments where agents, today, simply cannot be connected to them. It's a problem of information policy: we can't allow third-party companies access to government data, or even its code. We've found workarounds, of course: we describe generic problem "shapes" to the model, then fill in the particulars ourselves. The problem is that the shapes aren't always perfect. The model reasons well about the generic case and can't see the specifics that break it, so when our particulars don't fit, the debugging lands back on a human — and by hand, that probably costs more time than if the LLM could simply have gotten it right the first time, because it knew the system we're actually tasked with developing and maintaining.
 
-The systems that most need governed agent tooling are the ones where agents
-cannot be connected at all. Inside a federal boundary, an agent touching
-government code is not a procurement question or a budget question — it is
-simply not authorized today. The reflexive conclusion is that this work waits
-until policy changes.
+Thinking carefully about MCP, though, I'm not sure its use necessarily, or always, violates the constraints we're under.
 
-That conclusion is wrong, and the reason is a sequencing observation. The tool
-layer and the model connection are separable. What makes an agent safe to
-connect is not the model; it is the enumerated surface it can act through — and
-that surface can be designed, built, reviewed, and accredited *now*, while
-connection remains prohibited. When authorization arrives, the reviewable
-artifact already exists and has a history. The alternative is to begin design
-on the day permission is granted, which is the worst possible moment to start
-thinking about least privilege.
+In the strictest sense, an MCP server exposes a few levers that can be pulled to accomplish some tasks within our system, and the model is allowed to pull them. What the model can't do is access our code. It might be useful if you can ask the agent, "Can you tell me if user XYZ has access to resource ABC?", and you've built an interface that lets the model answer that question without ever seeing your database, or a single line of code. The tool layer moves the knowledge out of the model's context and into the tool implementation. The model doesn't need to know how permissions work — only that it may ask.
 
-The target architecture is not speculative. An authorized model runs inside the
-boundary — Bedrock in GovCloud, or an equivalent accredited endpoint. MCP is
-the controlled tool layer between that model and the system. The capability
-boundaries are the ATO story, and they are unusually well-suited to it: every
-agent action is a tool call, so the audit log is complete by construction rather
-than by instrumentation. Least privilege is structural rather than
-policy-enforced — an agent cannot exceed its tool list, because there is no
-mechanism by which it could. And because the tool layer never links against the
-application, source never leaves the boundary; the model sees what a tool
-returns, and nothing else.
+The question, of course, remains: what if the prompt, or its answer, still contains CUI? But that's a risk-tolerance-adjustable design surface, not a wall. Tool inputs and outputs are where we can apply some level of access minimization. We can return booleans instead of records, or identifiers instead of names. And now every question the model asks is a discrete, reviewable event. A smaller CUI footprint isn't the same as having none at all. But a small, enumerated, logged surface is something we can write policy around.
 
-This is also why the boundaries here are stated as *deliberate negations*
-rather than as unimplemented features. "No write tools in v1" is a reviewable
-claim. "Writes not yet implemented" is a roadmap item. An accreditation
-reviewer needs the first kind of sentence, and a design that cannot produce
-one is not ready to be reviewed regardless of how well it works.
+And that's kind of the point of all this: there's a specific set of policy changes it will take to get to our agentic future, and some level of risk tolerance. But that tolerance depends on having the right infrastructure in place first, both at the level of the LLM interface itself, and at the level of access the application grants the LLM.
 
-The parallel is exact, and it is the reason this repository exists on a
-production system the author owns rather than on the systems that need it most:
-those systems cannot host the demonstration. Tertulia is a real application
-with real users, real authentication, and a real database — the pattern is
-shown working under production constraints, in public, where it can be read and
-argued with. The governance problem is not that we lack a safe way to connect
-agents to sensitive systems. It is that the safe way has to be built and
-reviewed before anyone will authorize connecting them, and almost nobody is
-building it during the window when it would help.
+The path forward that doesn't involve local LLMs still seems to be authorized models inside institutionally accepted boundaries — Bedrock in GovCloud, or an equivalent accredited endpoint. Reaching that boundary is itself a modernization project. I'm already being asked to work towards it for my clients: on-prem Jenkins to GitHub Actions, on-prem Oracle toward RDS. The infrastructure is the prerequisite for the tools we know we'll eventually want. Ok, we want them today, we just can't have them yet.
+
+So, in the long run, I think this pattern could be useful in government software engineering. This repository exists as a proof-of-concept: it exists to solve problems I have in an environment I control, against a codebase and data I'm allowed to share (my own, and nearly all of it public). One day it won't just be Tertulia.
 
 ## License
 
