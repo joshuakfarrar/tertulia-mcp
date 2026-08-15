@@ -45,6 +45,25 @@ Requires Node 20+. The database tools additionally require the PostgreSQL
 client (`psql`) on `PATH`; the test runner requires whichever build tool the
 target project uses (Mill or sbt).
 
+### Windows
+
+Supported, with two platform-specific behaviours in `run_tests`:
+
+- A repo-local `mill.bat` / `sbt.bat` (or `.cmd`) wrapper is detected and
+  launched through an explicit `cmd.exe /d /s /c` — Node refuses to spawn
+  batch files without a shell (CVE-2024-27980), and routing the `PATH`
+  fallback through cmd also picks up `.bat`/`.cmd` shims that a plain spawn
+  would miss. This does not reopen the command-injection door: the test-filter
+  charset excludes every cmd metacharacter, so nothing an agent passes
+  survives as cmd syntax.
+- Timeout enforcement uses `taskkill /T /F` to take down the build's process
+  tree, since POSIX process groups don't exist on Windows.
+
+The boundary suite and all runtime behaviour are exercised on Linux in CI
+terms; the Windows launch path is code-reviewed but less travelled. If
+something misbehaves there, an issue with the `command:` line from the tool's
+output is enough to work from.
+
 ## Configuration
 
 All configuration is environment variables, and all of them are local.

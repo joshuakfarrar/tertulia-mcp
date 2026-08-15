@@ -59,9 +59,13 @@ interface Detected {
   tool: BuildTool;
   /** Executable to invoke, absolute for wrapper scripts. */
   command: string;
+  /** Arguments that select the launcher itself, before any test arguments. */
+  baseArgs: string[];
   /** How the tool was identified, for the tool's own output. */
   evidence: string;
 }
+
+const IS_WINDOWS = process.platform === "win32";
 
 function isExecutable(path: string): boolean {
   try {
@@ -70,6 +74,39 @@ function isExecutable(path: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * Resolve how to launch a build tool, preferring a repo-local wrapper.
+ *
+ * On POSIX the wrapper is an executable script (`./mill`, `./sbt`) and can be
+ * spawned directly. On Windows the wrapper is a batch file (`mill.bat`), and
+ * Node refuses to spawn batch files without a shell (CVE-2024-27980), so both
+ * the wrapper and the PATH fallback are launched through an explicit
+ * `cmd.exe /d /s /c`. Routing the fallback through cmd also buys PATHEXT
+ * resolution, which plain spawn does not do — `mill` installed as a `.bat` or
+ * `.cmd` shim would otherwise never be found.
+ *
+ * This does not reopen the injection door the filter charset closed: the
+ * charset (`FILTER_PATTERN`) excludes every cmd metacharacter — quotes,
+ * carets, ampersands, pipes, percent signs, spaces — so nothing an agent can
+ * pass survives as cmd syntax.
+ */
+function resolveLauncher(root: string, tool: BuildTool): Pick<Detected, "command" | "baseArgs" | "evidence"> {
+  if (IS_WINDOWS) {
+    for (const name of [`${tool}.bat`, `${tool}.cmd`]) {
+      const wrapper = join(root, name);
+      if (existsSync(wrapper)) {
+        return { command: "cmd.exe", baseArgs: ["/d", "/s", "/c", wrapper], evidence: `using ${name} wrapper via cmd.exe` };
+      }
+    }
+    return { command: "cmd.exe", baseArgs: ["/d", "/s", "/c", tool], evidence: `using ${tool} from PATH via cmd.exe` };
+  }
+  const wrapper = join(root, tool);
+  if (isExecutable(wrapper)) {
+    return { command: wrapper, baseArgs: [], evidence: `using ./${tool} wrapper script` };
+  }
+  return { command: tool, baseArgs: [], evidence: `using ${tool} from PATH` };
 }
 
 /**
@@ -85,24 +122,14 @@ export function detectBuildTool(root: string): Detected {
   // Mill: build.mill (Mill 0.12+) or build.sc (older layouts).
   for (const marker of ["build.mill", "build.sc"]) {
     if (existsSync(join(root, marker))) {
-      const wrapper = join(root, "mill");
-      const useWrapper = isExecutable(wrapper);
-      return {
-        tool: "mill",
-        command: useWrapper ? wrapper : "mill",
-        evidence: `${marker} present; using ${useWrapper ? "./mill wrapper script" : "mill from PATH"}`,
-      };
+      const launcher = resolveLauncher(root, "mill");
+      return { tool: "mill", ...launcher, evidence: `${marker} present; ${launcher.evidence}` };
     }
   }
 
   if (existsSync(join(root, "build.sbt"))) {
-    const wrapper = join(root, "sbt");
-    const useWrapper = isExecutable(wrapper);
-    return {
-      tool: "sbt",
-      command: useWrapper ? wrapper : "sbt",
-      evidence: `build.sbt present; using ${useWrapper ? "./sbt wrapper script" : "sbt from PATH"}`,
-    };
+    const launcher = resolveLauncher(root, "sbt");
+    return { tool: "sbt", ...launcher, evidence: `build.sbt present; ${launcher.evidence}` };
   }
 
   throw new Error(
@@ -151,15 +178,19 @@ function failureHighlights(output: string): string[] {
 const SIGKILL_GRACE_MS = 5_000;
 
 /**
- * Run a build command, enforcing the timeout against the whole process group.
+ * Run a build command, enforcing the timeout against the whole process tree.
  *
- * The child is spawned detached so that it leads a new process group, and the
- * timeout signals that group rather than the child alone. This matters because
- * both Mill and sbt run their real work in a long-lived daemon: signalling only
- * the launcher leaves the daemon alive, still holding the inherited stdout
- * pipe, so the output stream never ends and the tool call hangs indefinitely
- * despite having "timed out". Killing the group closes the pipes and lets the
- * call return.
+ * Killing only the direct child is not enough: both Mill and sbt run their
+ * real work in a long-lived daemon, and signalling only the launcher leaves
+ * the daemon alive, still holding the inherited stdout pipe, so the output
+ * stream never ends and the tool call hangs indefinitely despite having
+ * "timed out".
+ *
+ * On POSIX the child is spawned detached so that it leads a process group,
+ * and the timeout signals the group — SIGTERM first, SIGKILL after a grace
+ * period. On Windows there are no process groups to signal; `taskkill /T /F`
+ * takes the tree down instead, forcibly and at once, because the graceful
+ * variant only posts WM_CLOSE, which console processes ignore.
  */
 async function spawnWithGroupTimeout(command: string, argv: string[], cwd: string, timeoutMs: number) {
   const subprocess = execa(command, argv, {
@@ -167,18 +198,24 @@ async function spawnWithGroupTimeout(command: string, argv: string[], cwd: strin
     reject: false,
     all: true,
     // No shell: argv elements reach the process verbatim, so nothing in
-    // `filter` can be reinterpreted as shell syntax.
+    // `filter` can be reinterpreted as shell syntax. (On Windows the command
+    // may be cmd.exe itself — see resolveLauncher for why that is still true.)
     shell: false,
     stripFinalNewline: false,
-    detached: true,
+    detached: !IS_WINDOWS,
+    windowsHide: true,
   });
 
   const pid = subprocess.pid;
   let timedOut = false;
 
-  /** Signal the whole group; ESRCH just means it already exited. */
-  const signalGroup = (signal: NodeJS.Signals): void => {
+  /** Take down the child's whole tree; failure just means it already exited. */
+  const killTree = (signal: NodeJS.Signals): void => {
     if (pid === undefined) return;
+    if (IS_WINDOWS) {
+      void execa("taskkill", ["/pid", String(pid), "/T", "/F"], { reject: false });
+      return;
+    }
     try {
       process.kill(-pid, signal);
     } catch {
@@ -188,10 +225,11 @@ async function spawnWithGroupTimeout(command: string, argv: string[], cwd: strin
 
   const timer = setTimeout(() => {
     timedOut = true;
-    signalGroup("SIGTERM");
-    // Escalate if the group ignores SIGTERM. Unref'd so a build that exits
-    // cleanly in the grace window does not hold the event loop open.
-    setTimeout(() => signalGroup("SIGKILL"), SIGKILL_GRACE_MS).unref();
+    killTree("SIGTERM");
+    // Escalate if the tree ignores SIGTERM (no-op on Windows, where the first
+    // kill is already forced). Unref'd so a build that exits cleanly in the
+    // grace window does not hold the event loop open.
+    setTimeout(() => killTree("SIGKILL"), SIGKILL_GRACE_MS).unref();
   }, timeoutMs);
 
   try {
@@ -199,8 +237,8 @@ async function spawnWithGroupTimeout(command: string, argv: string[], cwd: strin
     return { result, timedOut };
   } finally {
     clearTimeout(timer);
-    // If the launcher exited but left the group behind, do not leak it.
-    if (timedOut) signalGroup("SIGKILL");
+    // If the launcher exited but left the tree behind, do not leak it.
+    if (timedOut) killTree("SIGKILL");
   }
 }
 
@@ -219,7 +257,7 @@ export async function runTests(
   }
 
   const detected = detectBuildTool(root);
-  const argv = testArgs(detected.tool, args.filter);
+  const argv = [...detected.baseArgs, ...testArgs(detected.tool, args.filter)];
   const timeoutSeconds = args.timeout_seconds ?? DEFAULT_TIMEOUT_SECONDS;
 
   return millRunner.run(async () => {
@@ -242,7 +280,7 @@ export async function runTests(
     lines.push(`duration:  ${elapsed}s`);
 
     if (timedOut) {
-      lines.push(`result:    TIMED OUT after ${timeoutSeconds}s (process group killed)`);
+      lines.push(`result:    TIMED OUT after ${timeoutSeconds}s (process tree killed)`);
     } else if (result.failed && result.exitCode === undefined) {
       lines.push(`result:    FAILED TO START — ${result.shortMessage ?? "unknown error"}`);
     } else {
