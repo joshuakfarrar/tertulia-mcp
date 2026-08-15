@@ -21,6 +21,7 @@
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { readdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 
@@ -87,7 +88,15 @@ async function mustAllow(label, name, args, expectSubstring) {
 console.log("\nfilesystem boundary — reads confined to the configured roots");
 await mustRefuse("relative traversal escapes root", "read_source", { project: "tertulia", path: "../../../etc/passwd" }, "outside the configured project root");
 await mustRefuse("absolute path refused", "read_source", { project: "tertulia", path: "/etc/passwd" }, "absolute");
-await mustAllow("in-root read succeeds", "read_source", { project: "tertulia", path: "README.md", start_line: 1, end_line: 3 });
+// Pick a real file from the checkout rather than assuming one by name — the
+// positive control must not depend on the target repo's layout.
+const sampleFile = readdirSync(TERTULIA_ROOT, { withFileTypes: true }).find((e) => e.isFile())?.name;
+if (sampleFile) {
+  await mustAllow("in-root read succeeds", "read_source", { project: "tertulia", path: sampleFile, start_line: 1, end_line: 3 });
+} else {
+  skipped += 1;
+  console.log("  SKIP  in-root read succeeds (no regular file at the checkout root)");
+}
 
 console.log("\nnetwork boundary — the host is fixed by configuration");
 await mustRefuse("protocol-relative host override", "app_status", { path: "//example.com/x" }, "may only reach");
