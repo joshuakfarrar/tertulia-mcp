@@ -62,8 +62,17 @@ function hostnameOf(value: string): string | null {
 
 /** `noun` names the target in lower case, e.g. "scratch database". */
 function requireLoopback(noun: string, envVar: string, value: string): void {
+  // The most common shape of an unverifiable URL, called out by name: a JDBC
+  // URL from a Java/Scala habit. Its nested scheme hides the hostname from the
+  // parser, and psql would not accept it anyway.
+  if (/^jdbc:/i.test(value)) {
+    throw new ConfigError(
+      `${envVar} looks like a JDBC URL. This server's database client is psql, which takes a ` +
+        `libpq URI — drop the "jdbc:" prefix (e.g. postgresql://localhost:5432/dbname). Refusing to start.`,
+    );
+  }
   const host = hostnameOf(value);
-  if (host === null) {
+  if (host === null || host === "") {
     throw new ConfigError(
       `${envVar} is not a parseable URL, so its target host cannot be verified as local. ` +
         `Refusing to start. Received: ${redact(value)}`,
